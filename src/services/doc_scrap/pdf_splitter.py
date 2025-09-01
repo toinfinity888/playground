@@ -26,7 +26,7 @@ client = AsyncOpenAI(
     api_key=OPENAI_API_KEY
 )
 
-path_test = '/Users/saraevsviatoslav/Documents/playground/data/processed/cleaned.pdf'
+path_test = '/Users/saraevsviatoslav/Documents/playground/data/raw/bike_theft_4_s41284-021-00285-3.pdf'
 
 
 prompt = """You are given the text content of a single PDF page. Your task is to decide whether this page starts a new subheading / new logical section, or whether its first narrative paragraph is a continuation of the previous page.
@@ -249,81 +249,159 @@ def drop_cover_and_table_of_contents(doc: fitz.Document):
     return doc
 
 
+from collections import defaultdict, Counter
+from typing import Dict, Any, List, Set
+import fitz  # PyMuPDF
+
 def find_repeated_headers_and_footers_by_position(
     doc_cleaned: fitz.Document,
     top_ratio: float = 0.05,
     bottom_ratio: float = 0.05,
-    min_repeats: float = 0.5,
-    round_precision: int = 1
+    min_repeats: float = 0.3,
+    round_precision: int = 1,
 ) -> Dict[str, Any]:
     """
-    Detects likely headers and footers in a PDF based on their repeated position
-    near the top or bottom of the page, regardless of their text content.
+    Detect likely headers and footers in a PDF by repeated vertical positions (Y)
+    near the top or bottom of pages, and by repeated text at those positions.
+
+    The function:
+      1) Scans each page, collects text blocks in the top/bottom bands.
+      2) Groups blocks by rounded Y coordinate (to merge tiny layout jitter).
+      3) Counts how often each Y coordinate occurs across pages (once per page).
+      4) For each Y, counts how often each text occurs across pages (once per page).
+      5) Selects positions / texts that repeat on at least `min_repeats` share of pages.
 
     Args:
-        doc (fitz.Document): The PDF document to analys
-        top_ratio (float): Portion of the top area of the page (0.1 = top 10%) to consider for header detection.
-        bottom_ratio (float): Portion of the bottom area of the page to consider for footer detection.
-        min_repeats (float): Minimum proportion of pages a position must appear on to be considered repeated.
-        round_precision (float): Decimal precision to round Y-coordinates when groying block positions.
+        doc_cleaned (fitz.Document): The PDF document to analyze.
+        top_ratio (float): Top band height as a fraction of page height (e.g., 0.05 = top 5%).
+        bottom_ratio (float): Bottom band height as a fraction of page height.
+        min_repeats (float): Minimal share of pages (0..1) for a position/text to be considered repeated.
+        round_precision (int): Decimal precision for rounding Y coordinates when grouping positions.
 
     Returns:
-        dict: {
-            "likely_header_positions": List[float],  # Y-coordinates of likely headers
-            "likely_footer_positions": List[float],  # Y-coordinates of likely footers
-            "position_texts": Dict[float, List[str]]  # (optional) block texts for inspection/debugging
-        }
+        dict with keys:
+            - "likely_header_positions": List[float]
+            - "likely_footer_positions": List[float]
+            - "header_text_counts_by_y": Dict[float, Dict[str, int]]
+                  # per Y position: text -> number of pages where it occurs (max 1 per page)
+            - "footer_text_counts_by_y": Dict[float, Dict[str, int]]
+            - "likely_header_texts_by_y": Dict[float, List[str]]
+                  # texts at Y that meet min_repeats threshold
+            - "likely_footer_texts_by_y": Dict[float, List[str]]
+            - "most_common_header_text": Optional[Tuple[str, int]]
+                  # (text, pages_count) across ALL likely header positions
+            - "most_common_footer_text": Optional[Tuple[str, int]]
     """
-
     num_pages = len(doc_cleaned)
+    if num_pages == 0:
+        return {
+            "likely_header_positions": [],
+            "likely_footer_positions": [],
+            "header_text_counts_by_y": {},
+            "footer_text_counts_by_y": {},
+            "likely_header_texts_by_y": {},
+            "likely_footer_texts_by_y": {},
+            "most_common_header_text": None,
+            "most_common_footer_text": None,
+        }
 
-    header_positions = Counter()
-    footer_positions = Counter()
-    position_texts = defaultdict(list)  # useful for debugging
+    # For positions: count unique pages per Y (avoid multiple blocks on same page)
+    header_pages_by_y: Dict[float, Set[int]] = defaultdict(set)
+    footer_pages_by_y: Dict[float, Set[int]] = defaultdict(set)
+
+    # For texts at each Y: count unique pages per (Y, text)
+    header_text_pages_by_y: Dict[float, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
+    footer_text_pages_by_y: Dict[float, Dict[str, Set[int]]] = defaultdict(lambda: defaultdict(set))
 
     for page_index, page in enumerate(doc_cleaned):
-        page_height = page.rect.height
-        blocks = page.get_text("dict")["blocks"]
+        page_h = page.rect.height
+        top_band = page_h * top_ratio
+        bottom_band_threshold = page_h * (1 - bottom_ratio)
 
+        blocks = page.get_text("dict").get("blocks", [])
         for block in blocks:
             if "lines" not in block:
-                continue  # skip image blocks, empty blocks, etc.
+                continue  # skip images, drawings, empty blocks
 
             y0 = block["bbox"][1]
             y1 = block["bbox"][3]
 
-            # Combine all text from the block
+            # Collapse all text in the block
             text = "".join(
-                span["text"] for line in block["lines"] for span in line["spans"]
+                span["text"] for line in block["lines"] for span in line.get("spans", [])
             ).strip()
-
             if not text:
                 continue
 
-            # Check if the block is near the top of the page
-            if y0 < page_height * top_ratio:
+            # Header candidate
+            if y0 <= top_band:
                 y_key = round(y0, round_precision)
-                header_positions[y_key] += 1
-                position_texts[y_key].append(text)
+                header_pages_by_y[y_key].add(page_index)
+                header_text_pages_by_y[y_key][text].add(page_index)
 
-            # Check if the block is near the bottom of the page
-            elif y1 > page_height * (1 - bottom_ratio):
+            # Footer candidate
+            elif y1 >= bottom_band_threshold:
                 y_key = round(y1, round_precision)
-                footer_positions[y_key] += 1
-                position_texts[y_key].append(text)
+                footer_pages_by_y[y_key].add(page_index)
+                footer_text_pages_by_y[y_key][text].add(page_index)
 
-    # Select positions that occur on at least `min_repeats` percent of pages
-    likely_header_positions = [
-        y for y, count in header_positions.items() if count / num_pages >= min_repeats
-    ]
-    likely_footer_positions = [
-        y for y, count in footer_positions.items() if count / num_pages >= min_repeats
-    ]
+    # Positions that appear on at least `min_repeats` share of pages
+    likely_header_positions = sorted(
+        y for y, pages in header_pages_by_y.items()
+        if len(pages) / num_pages >= min_repeats
+    )
+    likely_footer_positions = sorted(
+        y for y, pages in footer_pages_by_y.items()
+        if len(pages) / num_pages >= min_repeats
+    )
+
+    # Texts at those positions passing the same threshold (counted once per page)
+    header_text_counts_by_y: Dict[float, Dict[str, int]] = {}
+    footer_text_counts_by_y: Dict[float, Dict[str, int]] = {}
+
+    # Also compute global most common text across likely positions
+    global_header_text_counts = Counter()
+    global_footer_text_counts = Counter()
+
+    for y in likely_header_positions:
+        counts = {t: len(pages) for t, pages in header_text_pages_by_y[y].items()}
+        header_text_counts_by_y[y] = counts
+        for t, c in counts.items():
+            global_header_text_counts[t] += c
+
+    for y in likely_footer_positions:
+        counts = {t: len(pages) for t, pages in footer_text_pages_by_y[y].items()}
+        footer_text_counts_by_y[y] = counts
+        for t, c in counts.items():
+            global_footer_text_counts[t] += c
+
+    likely_header_texts_by_y = {
+        y: sorted([t for t, c in header_text_counts_by_y.get(y, {}).items()
+                   if c / num_pages >= min_repeats])
+        for y in likely_header_positions
+    }
+    likely_footer_texts_by_y = {
+        y: sorted([t for t, c in footer_text_counts_by_y.get(y, {}).items()
+                   if c / num_pages >= min_repeats])
+        for y in likely_footer_positions
+    }
+
+    most_common_header_text = (
+        global_header_text_counts.most_common(1)[0] if global_header_text_counts else None
+    )
+    most_common_footer_text = (
+        global_footer_text_counts.most_common(1)[0] if global_footer_text_counts else None
+    )
 
     return {
         "likely_header_positions": likely_header_positions,
         "likely_footer_positions": likely_footer_positions,
-        "position_texts": position_texts  # optional, can be removed
+        "header_text_counts_by_y": header_text_counts_by_y,
+        "footer_text_counts_by_y": footer_text_counts_by_y,
+        "likely_header_texts_by_y": likely_header_texts_by_y,
+        "likely_footer_texts_by_y": likely_footer_texts_by_y,
+        "most_common_header_text": most_common_header_text,
+        "most_common_footer_text": most_common_footer_text,
     }
 
 # =====================================================================================
@@ -366,7 +444,7 @@ async def pages_starting_with_subheading(
     """
 
     pages_open_with_sub = []   # Pages that likely start a new section based on title font size
-    is_table_on_page,  = is_table(path_test, head_foot_position, doc_cleaned)
+    is_table_on_page = is_table(path_test, head_foot_position, doc_cleaned)
      
  
     # Save doc to check the work of this function
@@ -377,7 +455,24 @@ async def pages_starting_with_subheading(
 
     header_y_positions = head_foot_position["likely_header_positions"]
     footer_y_positions = head_foot_position["likely_footer_positions"]
-    text_found_as_footer = head_foot_position["position_texts"]
+
+    header_text_counts_by_y = head_foot_position['header_text_counts_by_y'],
+    footer_text_counts_by_y = ['footer_text_counts_by_y'],
+    likely_header_texts_by_y = ['likely_header_texts_by_y'],
+    likely_footer_texts_by_y = ['likely_footer_texts_by_y'],
+    most_common_header_text = ['most_common_header_text'],
+    most_common_footer_text = ['most_common_footer_text'],
+
+    print(f'Header Y position: {header_y_positions}')
+    print(f'Footer Y position : {footer_y_positions}')
+    print(f'Header text counts by Y: {header_text_counts_by_y}')
+    print(f'Footer text text counts by Y: {footer_text_counts_by_y}')
+    print(f'Likely header texts by Y: {likely_header_texts_by_y}')
+    print(f'Likely footer texts by Y: {likely_footer_texts_by_y}')
+    print(f'Most common header text: {most_common_header_text}')
+    print(f'Most common footer text: {most_common_footer_text}')
+    
+
 
     # Take a size of first line on the page and find a number of pages opening with title
     for page_index, page in enumerate(doc_cleaned):
@@ -403,7 +498,7 @@ async def pages_starting_with_subheading(
         if sizes_on_first_line:
             first_line_counter = Counter(sizes_on_first_line)
             most_common_size_on_first_line, _ = first_line_counter.most_common(1)[0]
-            #logger.info(f"The most common size on the first line: {most_common_size_on_first_line} while the general size is {size_of_text}")
+            logger.info(f"The most common size on the first line: {most_common_size_on_first_line} while the general size is {size_of_text}")
 
             if most_common_size_on_first_line > size_of_text: # Probably it is a title
                 pages_open_with_sub.append(page_index) 
@@ -591,7 +686,7 @@ def detect_table_like_structure(
 def is_table(
         path: Path | str,
         head_foot_position: Dict,
-        doc_cleaned: fitz.Document) -> tuple[Dict[str, Dict[int, bool]], float]:
+        doc_cleaned: fitz.Document) -> tuple[Dict[str, Dict[int, bool]], Dict]:
     
     """
     Detects presence of tables on each page of a PDF document using multiple approaches.
@@ -697,7 +792,7 @@ def is_table(
                 'pages_with_lines': pages_with_lines,
                 'by_algorithm': page_founded_by_algorithm}
     
-    return signs, start_position_img
+    return signs
 
 
 
